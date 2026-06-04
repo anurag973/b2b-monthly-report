@@ -1,17 +1,15 @@
 """
 B2B Monthly Report — auto-generates on the 1st of every month.
-Emails the cleaned Excel to the recipient on success.
+Uploads Excel to Google Drive and emails the link on success.
 On failure, GitHub Actions sends an alert email.
 """
 import json
 import os
-import re
 import smtplib
 import time
 import zipfile
 from calendar import monthrange
 from datetime import date
-from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -19,6 +17,9 @@ from pathlib import Path
 import openpyxl
 import requests
 from dotenv import load_dotenv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 from openpyxl.styles import Alignment, Font, PatternFill
 
 load_dotenv()
@@ -51,6 +52,10 @@ INTEREST_BATCH = 3000
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 REPORT_RECIPIENT = os.environ.get("REPORT_RECIPIENT")
+
+# ── Google Drive ───────────────────────────────────────────────────────────
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
+GDRIVE_SERVICE_ACCOUNT_JSON = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")
 
 
 RISK_COLUMNS = [
@@ -350,21 +355,60 @@ def build_workbook(all_rows, interest_map, remove_ids, removed_rows, running):
     return kept, total_pos
 
 
+# ── Google Drive upload ────────────────────────────────────────────────────
+def upload_to_drive():
+    print("Uploading to Google Drive...")
+
+    service_account_info = json.loads(GDRIVE_SERVICE_ACCOUNT_JSON)
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=["https://www.googleapis.com/auth/drive"],
+    )
+    drive_service = build("drive", "v3", credentials=credentials)
+
+    file_name = f"B2B Report — {today.strftime('%B %Y')}.xlsx"
+
+    # Delete existing file with same name in folder to avoid duplicates
+    existing = drive_service.files().list(
+        q=f"name='{file_name}' and '{GDRIVE_FOLDER_ID}' in parents and trashed=false",
+        fields="files(id, name)",
+    ).execute()
+    for f in existing.get("files", []):
+        drive_service.files().delete(fileId=f["id"]).execute()
+        print(f"  Deleted existing file: {f['name']}")
+
+    # Upload new file
+    file_metadata = {
+        "name": file_name,
+        "parents": [GDRIVE_FOLDER_ID],
+    }
+    media = MediaFileUpload(
+        str(OUT_PATH),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        resumable=True,
+    )
+    uploaded = drive_service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, webViewLink",
+    ).execute()
+
+    file_id = uploaded["id"]
+    view_link = uploaded["webViewLink"]
+
+    # Make the file accessible to anyone with the link
+    drive_service.permissions().create(
+        fileId=file_id,
+        body={"type": "anyone", "role": "reader"},
+    ).execute()
+
+    print(f"  Uploaded: {file_name}")
+    print(f"  Link: {view_link}")
+    return view_link
+
+
 # ── Email ──────────────────────────────────────────────────────────────────
-def send_report_email(kept, total_pos, removed_count, po_removed):
-    print("Compressing report...")
-    zip_path = OUT_PATH.with_suffix(".zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(OUT_PATH, OUT_PATH.name)
-
-    zip_size_mb = zip_path.stat().st_size / 1e6
-    print(f"Compressed size: {zip_size_mb:.1f} MB")
-
-    if zip_size_mb > 24:
-        print("Warning: zip still too large, sending summary only")
-        send_summary_only_email(kept, total_pos, removed_count, po_removed)
-        return
-
+def send_report_email(kept, total_pos, removed_count, po_removed, drive_link):
     print("Sending report email...")
     msg = MIMEMultipart()
     msg["From"] = GMAIL_ADDRESS
@@ -373,7 +417,9 @@ def send_report_email(kept, total_pos, removed_count, po_removed):
 
     body = f"""Hi Anurag,
 
-Please find attached the cleaned B2B sheet for {today.strftime('%B %Y')} (zipped).
+The cleaned B2B sheet for {today.strftime('%B %Y')} is ready.
+
+📎 Download here: {drive_link}
 
 Summary:
   Snapshot Date     : {SNAPSHOT_DATE}
@@ -385,15 +431,6 @@ Summary:
 This is an automated report generated on {today.isoformat()}.
 """
     msg.attach(MIMEText(body, "plain"))
-
-    with open(zip_path, "rb") as f:
-        attachment = MIMEApplication(f.read(), _subtype="zip")
-        attachment.add_header(
-            "Content-Disposition",
-            "attachment",
-            filename=zip_path.name,
-        )
-        msg.attach(attachment)
 
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.starttls()
@@ -403,42 +440,9 @@ This is an automated report generated on {today.isoformat()}.
     print(f"Email sent to {REPORT_RECIPIENT}")
 
 
-def send_summary_only_email(kept, total_pos, removed_count, po_removed):
-    print("Sending summary-only email...")
-    msg = MIMEMultipart()
-    msg["From"] = GMAIL_ADDRESS
-    msg["To"] = REPORT_RECIPIENT
-    msg["Subject"] = f"✅ B2B Monthly Report — {today.strftime('%B %Y')} (summary only)"
-
-    body = f"""Hi Anurag,
-
-The B2B report for {today.strftime('%B %Y')} was generated successfully but the
-file is too large to attach via email (>24MB even after compression).
-
-Summary:
-  Snapshot Date     : {SNAPSHOT_DATE}
-  Final Loanshares  : {kept:,}
-  Removed           : {removed_count:,}
-  PO Removed        : Rs {po_removed/1e7:.4f} cr
-  Final Total POS   : Rs {total_pos/1e7:.2f} cr
-
-Please run the script locally to get the Excel file.
-
-This is an automated report generated on {today.isoformat()}.
-"""
-    msg.attach(MIMEText(body, "plain"))
-
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_ADDRESS, REPORT_RECIPIENT, msg.as_string())
-
-    print(f"Summary email sent to {REPORT_RECIPIENT}")
-
-
 # ── Cleanup ────────────────────────────────────────────────────────────────
 def cleanup():
-    for f in [RISK_DUMP, INTEREST_MAP, OUT_PATH, OUT_PATH.with_suffix(".zip")]:
+    for f in [RISK_DUMP, INTEREST_MAP, OUT_PATH]:
         if f.exists():
             f.unlink()
     if BASE.exists():
@@ -468,7 +472,9 @@ def main():
         all_rows, interest_map, remove_ids, removed_rows, po_removed
     )
 
-    send_report_email(kept, total_pos, len(removed_rows), po_removed)
+    drive_link = upload_to_drive()
+
+    send_report_email(kept, total_pos, len(removed_rows), po_removed, drive_link)
 
     cleanup()
 
