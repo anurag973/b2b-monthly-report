@@ -7,7 +7,6 @@ import json
 import os
 import smtplib
 import time
-import zipfile
 from calendar import monthrange
 from datetime import date
 from email.mime.multipart import MIMEMultipart
@@ -368,13 +367,18 @@ def upload_to_drive():
 
     file_name = f"B2B Report — {today.strftime('%B %Y')}.xlsx"
 
-    # Delete existing file with same name in folder to avoid duplicates
+    # Delete existing file with same name to avoid duplicates
     existing = drive_service.files().list(
         q=f"name='{file_name}' and '{GDRIVE_FOLDER_ID}' in parents and trashed=false",
         fields="files(id, name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
     ).execute()
     for f in existing.get("files", []):
-        drive_service.files().delete(fileId=f["id"]).execute()
+        drive_service.files().delete(
+            fileId=f["id"],
+            supportsAllDrives=True,
+        ).execute()
         print(f"  Deleted existing file: {f['name']}")
 
     # Upload new file
@@ -391,15 +395,17 @@ def upload_to_drive():
         body=file_metadata,
         media_body=media,
         fields="id, webViewLink",
+        supportsAllDrives=True,
     ).execute()
 
     file_id = uploaded["id"]
     view_link = uploaded["webViewLink"]
 
-    # Make the file accessible to anyone with the link
+    # Make file accessible to anyone with the link
     drive_service.permissions().create(
         fileId=file_id,
         body={"type": "anyone", "role": "reader"},
+        supportsAllDrives=True,
     ).execute()
 
     print(f"  Uploaded: {file_name}")
