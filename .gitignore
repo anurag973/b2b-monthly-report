@@ -1,0 +1,6 @@
+.env
+output/
+*.json
+*.xlsx
+__pycache__/
+*.pyc
