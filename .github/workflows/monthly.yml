@@ -28,6 +28,8 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           REPORT_RECIPIENT: ${{ secrets.REPORT_RECIPIENT }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: python report.py
 
       - name: Send failure email
@@ -41,10 +43,8 @@ jobs:
           subject: "❌ B2B Monthly Report FAILED - ${{ github.run_id }}"
           body: |
             The B2B monthly report script failed.
-
             Run ID   : ${{ github.run_id }}
             Run URL  : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
             Please check the logs at the URL above for the full error traceback.
           to: ${{ secrets.REPORT_RECIPIENT }}
           from: ${{ secrets.GMAIL_ADDRESS }}
