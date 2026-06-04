@@ -8,6 +8,7 @@ import os
 import re
 import smtplib
 import time
+import zipfile
 from calendar import monthrange
 from datetime import date
 from email.mime.application import MIMEApplication
@@ -26,10 +27,10 @@ load_dotenv()
 today = date.today()
 first = today.replace(day=1)
 last_day = monthrange(today.year, today.month)[1]
-SNAPSHOT_DATE = first.isoformat()                      # e.g. 2026-06-01
-DUE_START = first.isoformat()                          # e.g. 2026-06-01
-DUE_END = today.replace(day=last_day).isoformat()      # e.g. 2026-06-30
-MONTH_LABEL = today.strftime("%B_%Y").lower()          # e.g. june_2026
+SNAPSHOT_DATE = first.isoformat()
+DUE_START = first.isoformat()
+DUE_END = today.replace(day=last_day).isoformat()
+MONTH_LABEL = today.strftime("%B_%Y").lower()
 
 # ── Superset ───────────────────────────────────────────────────────────────
 SUPERSET_URL = os.environ.get("SUPERSET_URL", "https://superset.bkosh.com")
@@ -129,7 +130,12 @@ def run_sql(session, db_id, sql, query_limit=PAGE_SIZE, retries=3):
         try:
             response = session.post(
                 f"{SUPERSET_URL}/api/v1/sqllab/execute/",
-                json={"database_id": db_id, "sql": sql, "runAsync": False, "queryLimit": query_limit},
+                json={
+                    "database_id": db_id,
+                    "sql": sql,
+                    "runAsync": False,
+                    "queryLimit": query_limit,
+                },
                 timeout=300,
             )
             if response.status_code != 200:
@@ -295,7 +301,11 @@ def build_workbook(all_rows, interest_map, remove_ids, removed_rows, running):
             and writeoff_status is None
             and writeoff_action is None
         )
-        accrued_interest = interest_map.get(int(ls_id), 0) if is_active and ls_id is not None else 0
+        accrued_interest = (
+            interest_map.get(int(ls_id), 0)
+            if is_active and ls_id is not None
+            else 0
+        )
         final_pos = principal_outstanding + accrued_interest
         total_pos += final_pos
         kept += 1
@@ -342,6 +352,19 @@ def build_workbook(all_rows, interest_map, remove_ids, removed_rows, running):
 
 # ── Email ──────────────────────────────────────────────────────────────────
 def send_report_email(kept, total_pos, removed_count, po_removed):
+    print("Compressing report...")
+    zip_path = OUT_PATH.with_suffix(".zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(OUT_PATH, OUT_PATH.name)
+
+    zip_size_mb = zip_path.stat().st_size / 1e6
+    print(f"Compressed size: {zip_size_mb:.1f} MB")
+
+    if zip_size_mb > 24:
+        print("Warning: zip still too large, sending summary only")
+        send_summary_only_email(kept, total_pos, removed_count, po_removed)
+        return
+
     print("Sending report email...")
     msg = MIMEMultipart()
     msg["From"] = GMAIL_ADDRESS
@@ -350,7 +373,7 @@ def send_report_email(kept, total_pos, removed_count, po_removed):
 
     body = f"""Hi Anurag,
 
-Please find attached the cleaned B2B sheet for {today.strftime('%B %Y')}.
+Please find attached the cleaned B2B sheet for {today.strftime('%B %Y')} (zipped).
 
 Summary:
   Snapshot Date     : {SNAPSHOT_DATE}
@@ -363,12 +386,12 @@ This is an automated report generated on {today.isoformat()}.
 """
     msg.attach(MIMEText(body, "plain"))
 
-    with open(OUT_PATH, "rb") as f:
-        attachment = MIMEApplication(f.read(), _subtype="xlsx")
+    with open(zip_path, "rb") as f:
+        attachment = MIMEApplication(f.read(), _subtype="zip")
         attachment.add_header(
             "Content-Disposition",
             "attachment",
-            filename=OUT_PATH.name,
+            filename=zip_path.name,
         )
         msg.attach(attachment)
 
@@ -380,9 +403,42 @@ This is an automated report generated on {today.isoformat()}.
     print(f"Email sent to {REPORT_RECIPIENT}")
 
 
+def send_summary_only_email(kept, total_pos, removed_count, po_removed):
+    print("Sending summary-only email...")
+    msg = MIMEMultipart()
+    msg["From"] = GMAIL_ADDRESS
+    msg["To"] = REPORT_RECIPIENT
+    msg["Subject"] = f"✅ B2B Monthly Report — {today.strftime('%B %Y')} (summary only)"
+
+    body = f"""Hi Anurag,
+
+The B2B report for {today.strftime('%B %Y')} was generated successfully but the
+file is too large to attach via email (>24MB even after compression).
+
+Summary:
+  Snapshot Date     : {SNAPSHOT_DATE}
+  Final Loanshares  : {kept:,}
+  Removed           : {removed_count:,}
+  PO Removed        : Rs {po_removed/1e7:.4f} cr
+  Final Total POS   : Rs {total_pos/1e7:.2f} cr
+
+Please run the script locally to get the Excel file.
+
+This is an automated report generated on {today.isoformat()}.
+"""
+    msg.attach(MIMEText(body, "plain"))
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls()
+        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_ADDRESS, REPORT_RECIPIENT, msg.as_string())
+
+    print(f"Summary email sent to {REPORT_RECIPIENT}")
+
+
 # ── Cleanup ────────────────────────────────────────────────────────────────
 def cleanup():
-    for f in [RISK_DUMP, INTEREST_MAP, OUT_PATH]:
+    for f in [RISK_DUMP, INTEREST_MAP, OUT_PATH, OUT_PATH.with_suffix(".zip")]:
         if f.exists():
             f.unlink()
     if BASE.exists():
@@ -408,7 +464,9 @@ def main():
 
     remove_ids, removed_rows, po_removed = identify_removed_rows(all_rows)
 
-    kept, total_pos = build_workbook(all_rows, interest_map, remove_ids, removed_rows, po_removed)
+    kept, total_pos = build_workbook(
+        all_rows, interest_map, remove_ids, removed_rows, po_removed
+    )
 
     send_report_email(kept, total_pos, len(removed_rows), po_removed)
 
