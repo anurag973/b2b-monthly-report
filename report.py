@@ -1,14 +1,17 @@
 """
 B2B Monthly Report — auto-generates on the 1st of every month.
-Uploads Excel to Google Drive and emails the link on success.
-On failure, GitHub Actions sends an alert email.
+Uploads Excel to Google Drive and emails the link.
+Also tries to split Excel into 3 parts and attach to email.
+If splitting fails, falls back to Drive link only.
 """
 import json
 import os
 import smtplib
 import time
+import traceback
 from calendar import monthrange
 from datetime import date
+from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -354,6 +357,46 @@ def build_workbook(all_rows, interest_map, remove_ids, removed_rows, running):
     return kept, total_pos
 
 
+# ── Split Excel into 3 parts ───────────────────────────────────────────────
+def split_excel():
+    print("Splitting Excel into 3 parts...")
+    blue_fill = PatternFill("solid", fgColor="1F4E79")
+
+    source = openpyxl.load_workbook(OUT_PATH, read_only=True)
+    main_sheet = source["jun_final"] if "jun_final" in source.sheetnames else source.active
+
+    # Read all data rows (skip header)
+    all_data = list(main_sheet.iter_rows(min_row=2, values_only=True))
+    source.close()
+
+    total_rows = len(all_data)
+    chunk_size = (total_rows + 2) // 3  # ceiling division into 3 parts
+    print(f"  Total rows: {total_rows:,} | ~{chunk_size:,} rows per part")
+
+    part_paths = []
+    for part_num in range(1, 4):
+        start = (part_num - 1) * chunk_size
+        end = min(start + chunk_size, total_rows)
+        chunk = all_data[start:end]
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = f"part_{part_num}"
+        ws.append(HEADERS)
+        style_header(ws, blue_fill)
+
+        for row in chunk:
+            ws.append(list(row))
+
+        part_path = BASE / f"b2b_sheet_{SNAPSHOT_DATE}_part{part_num}of3.xlsx"
+        wb.save(part_path)
+        size_mb = part_path.stat().st_size / 1e6
+        print(f"  Part {part_num}: {len(chunk):,} rows | {size_mb:.1f} MB")
+        part_paths.append(part_path)
+
+    return part_paths
+
+
 # ── Google Drive upload ────────────────────────────────────────────────────
 def upload_to_drive():
     print("Uploading to Google Drive...")
@@ -414,18 +457,68 @@ def upload_to_drive():
 
 
 # ── Email ──────────────────────────────────────────────────────────────────
-def send_report_email(kept, total_pos, removed_count, po_removed, drive_link):
-    print("Sending report email...")
+def send_email_with_attachments(kept, total_pos, removed_count, po_removed,
+                                 drive_link, part_paths):
+    print("Sending email with split attachments...")
     msg = MIMEMultipart()
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = REPORT_RECIPIENT
-    msg["Subject"] = f"✅ B2B Monthly Report — {today.strftime('%B %Y')}"
+    msg["Subject"] = f"✅ B2B Monthly Report — {today.strftime('%B %Y')} (3 parts)"
+
+    body = f"""Hi Anurag,
+
+The cleaned B2B sheet for {today.strftime('%B %Y')} is attached in 3 parts.
+
+🔗 Full file on Google Drive (backup): {drive_link}
+
+Summary:
+  Snapshot Date     : {SNAPSHOT_DATE}
+  Final Loanshares  : {kept:,}
+  Removed           : {removed_count:,}
+  PO Removed        : Rs {po_removed/1e7:.4f} cr
+  Final Total POS   : Rs {total_pos/1e7:.2f} cr
+
+Note: All 3 parts share the same columns. Combine them for the full dataset.
+
+This is an automated report generated on {today.isoformat()}.
+"""
+    msg.attach(MIMEText(body, "plain"))
+
+    for part_path in part_paths:
+        with open(part_path, "rb") as f:
+            attachment = MIMEApplication(f.read(), _subtype="xlsx")
+            attachment.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=part_path.name,
+            )
+            msg.attach(attachment)
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls()
+        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_ADDRESS, REPORT_RECIPIENT, msg.as_string())
+
+    print(f"Email with attachments sent to {REPORT_RECIPIENT}")
+
+
+def send_drive_only_email(kept, total_pos, removed_count, po_removed,
+                           drive_link, split_error):
+    print("Sending Drive-only fallback email...")
+    msg = MIMEMultipart()
+    msg["From"] = GMAIL_ADDRESS
+    msg["To"] = REPORT_RECIPIENT
+    msg["Subject"] = f"✅ B2B Monthly Report — {today.strftime('%B %Y')} (Drive link)"
 
     body = f"""Hi Anurag,
 
 The cleaned B2B sheet for {today.strftime('%B %Y')} is ready.
 
 📎 Download here: {drive_link}
+
+Note: Email attachment failed (file too large even after splitting).
+Reason: {split_error}
+The full file is available on Google Drive at the link above.
 
 Summary:
   Snapshot Date     : {SNAPSHOT_DATE}
@@ -443,12 +536,16 @@ This is an automated report generated on {today.isoformat()}.
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_ADDRESS, REPORT_RECIPIENT, msg.as_string())
 
-    print(f"Email sent to {REPORT_RECIPIENT}")
+    print(f"Fallback Drive-only email sent to {REPORT_RECIPIENT}")
 
 
 # ── Cleanup ────────────────────────────────────────────────────────────────
 def cleanup():
-    for f in [RISK_DUMP, INTEREST_MAP, OUT_PATH]:
+    patterns = [RISK_DUMP, INTEREST_MAP, OUT_PATH]
+    # also clean up any split part files
+    for p in BASE.glob("*_part*of3.xlsx"):
+        patterns.append(p)
+    for f in patterns:
         if f.exists():
             f.unlink()
     if BASE.exists():
@@ -478,9 +575,37 @@ def main():
         all_rows, interest_map, remove_ids, removed_rows, po_removed
     )
 
+    # Always upload to Drive first
     drive_link = upload_to_drive()
 
-    send_report_email(kept, total_pos, len(removed_rows), po_removed, drive_link)
+    # Try split + email attachments, fall back to Drive link only
+    try:
+        part_paths = split_excel()
+
+        # Check all parts are under 24MB
+        oversized = [
+            p for p in part_paths
+            if p.stat().st_size / 1e6 > 24
+        ]
+        if oversized:
+            raise ValueError(
+                f"{len(oversized)} part(s) still exceed 24MB: "
+                + ", ".join(f"{p.name} ({p.stat().st_size/1e6:.1f}MB)" for p in oversized)
+            )
+
+        send_email_with_attachments(
+            kept, total_pos, len(removed_rows), po_removed,
+            drive_link, part_paths
+        )
+
+    except Exception as e:
+        split_error = traceback.format_exc()
+        print(f"Split/attach failed: {e}")
+        print("Falling back to Drive-only email...")
+        send_drive_only_email(
+            kept, total_pos, len(removed_rows), po_removed,
+            drive_link, str(e)
+        )
 
     cleanup()
 
