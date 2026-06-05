@@ -435,11 +435,15 @@ def upload_to_drive():
         includeItemsFromAllDrives=True,
     ).execute()
     for f in existing.get("files", []):
-        drive_service.files().delete(
-            fileId=f["id"],
-            supportsAllDrives=True,
-        ).execute()
-        print(f"  Deleted existing file: {f['name']}")
+        try:
+            drive_service.files().delete(
+                fileId=f["id"],
+                supportsAllDrives=True,
+            ).execute()
+            print(f"  Deleted existing file: {f['name']}")
+        except Exception as del_err:
+            # File may have already been deleted — safe to ignore
+            print(f"  Could not delete {f['name']} (already gone?): {del_err}")
 
     # Upload new file
     file_metadata = {
@@ -471,8 +475,6 @@ def upload_to_drive():
     print(f"  Uploaded: {file_name}")
     print(f"  Link: {view_link}")
     return view_link
-
-
 # ── Email ──────────────────────────────────────────────────────────────────
 def send_email_with_attachments(kept, total_pos, removed_count, po_removed,
                                 drive_link, part_paths):
