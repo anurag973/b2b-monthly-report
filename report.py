@@ -101,16 +101,15 @@ PARTIAL_LENDERS_180 = {
 
 
 # ── Superset auth ──────────────────────────────────────────────────────────
-def superset_session() -> requests.Session:
-    username = os.environ.get("SUPERSET_USERNAME")
-    password = os.environ.get("SUPERSET_PASSWORD")
-    if not username or not password:
-        raise RuntimeError("Set SUPERSET_USERNAME and SUPERSET_PASSWORD.")
-
-    session = requests.Session()
+def _authenticate(session: requests.Session):
     login = session.post(
         f"{SUPERSET_URL}/api/v1/security/login",
-        json={"username": username, "password": password, "provider": "db", "refresh": True},
+        json={
+            "username": session._superset_username,
+            "password": session._superset_password,
+            "provider": "db",
+            "refresh": True,
+        },
         timeout=60,
     )
     login.raise_for_status()
@@ -127,6 +126,17 @@ def superset_session() -> requests.Session:
         "Content-Type": "application/json",
         "Referer": f"{SUPERSET_URL}/sqllab/",
     })
+
+
+def superset_session() -> requests.Session:
+    username = os.environ.get("SUPERSET_USERNAME")
+    password = os.environ.get("SUPERSET_PASSWORD")
+    if not username or not password:
+        raise RuntimeError("Set SUPERSET_USERNAME and SUPERSET_PASSWORD.")
+    session = requests.Session()
+    session._superset_username = username
+    session._superset_password = password
+    _authenticate(session)
     return session
 
 
@@ -145,11 +155,20 @@ def run_sql(session, db_id, sql, query_limit=PAGE_SIZE, retries=3):
                 },
                 timeout=300,
             )
+            if response.status_code == 401:
+                print("  Token expired (401), re-authenticating...")
+                _authenticate(session)
+                continue
             if response.status_code != 200:
                 raise RuntimeError(response.text)
             payload = response.json()
+            payload_str = json.dumps(payload)
+            if "Token has expired" in payload_str:
+                print("  Token expired in payload, re-authenticating...")
+                _authenticate(session)
+                continue
             if payload.get("error") or payload.get("errors"):
-                raise RuntimeError(json.dumps(payload, indent=2))
+                raise RuntimeError(payload_str)
             return payload.get("data", [])
         except Exception as exc:
             last_error = exc
@@ -363,14 +382,12 @@ def split_excel():
     blue_fill = PatternFill("solid", fgColor="1F4E79")
 
     source = openpyxl.load_workbook(OUT_PATH, read_only=True)
-    main_sheet = source["jun_final"] if "jun_final" in source.sheetnames else source.active
-
-    # Read all data rows (skip header)
+    main_sheet = source.active
     all_data = list(main_sheet.iter_rows(min_row=2, values_only=True))
     source.close()
 
     total_rows = len(all_data)
-    chunk_size = (total_rows + 2) // 3  # ceiling division into 3 parts
+    chunk_size = (total_rows + 2) // 3
     print(f"  Total rows: {total_rows:,} | ~{chunk_size:,} rows per part")
 
     part_paths = []
@@ -458,7 +475,7 @@ def upload_to_drive():
 
 # ── Email ──────────────────────────────────────────────────────────────────
 def send_email_with_attachments(kept, total_pos, removed_count, po_removed,
-                                 drive_link, part_paths):
+                                drive_link, part_paths):
     print("Sending email with split attachments...")
     msg = MIMEMultipart()
     msg["From"] = GMAIL_ADDRESS
@@ -503,7 +520,7 @@ This is an automated report generated on {today.isoformat()}.
 
 
 def send_drive_only_email(kept, total_pos, removed_count, po_removed,
-                           drive_link, split_error):
+                          drive_link, split_error):
     print("Sending Drive-only fallback email...")
     msg = MIMEMultipart()
     msg["From"] = GMAIL_ADDRESS
@@ -542,7 +559,6 @@ This is an automated report generated on {today.isoformat()}.
 # ── Cleanup ────────────────────────────────────────────────────────────────
 def cleanup():
     patterns = [RISK_DUMP, INTEREST_MAP, OUT_PATH]
-    # also clean up any split part files
     for p in BASE.glob("*_part*of3.xlsx"):
         patterns.append(p)
     for f in patterns:
@@ -590,7 +606,10 @@ def main():
         if oversized:
             raise ValueError(
                 f"{len(oversized)} part(s) still exceed 24MB: "
-                + ", ".join(f"{p.name} ({p.stat().st_size/1e6:.1f}MB)" for p in oversized)
+                + ", ".join(
+                    f"{p.name} ({p.stat().st_size/1e6:.1f}MB)"
+                    for p in oversized
+                )
             )
 
         send_email_with_attachments(
@@ -599,7 +618,6 @@ def main():
         )
 
     except Exception as e:
-        split_error = traceback.format_exc()
         print(f"Split/attach failed: {e}")
         print("Falling back to Drive-only email...")
         send_drive_only_email(
