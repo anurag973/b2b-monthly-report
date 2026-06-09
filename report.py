@@ -1,8 +1,7 @@
 """
-B2B Monthly Report — auto-generates on the 1st of every month.
-Uploads Excel to Google Drive and emails the link.
-Also splits Excel into parts and sends one email per part.
-If splitting fails, falls back to Drive link only.
+B2B Monthly Report.
+- When run via GitHub Actions: fetches data, builds Excel, uploads to Drive, sends email
+- When imported by Dataiku: run_pipeline() returns a DataFrame for DB write
 """
 import json
 import os
@@ -16,15 +15,30 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
-import openpyxl
+import pandas as pd
 import requests
-from dotenv import load_dotenv
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from openpyxl.styles import Alignment, Font, PatternFill
 
-load_dotenv()
+# Only import these when not running in Dataiku
+try:
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    GDRIVE_AVAILABLE = True
+except ImportError:
+    GDRIVE_AVAILABLE = False
 
 # ── Dates (auto-calculated) ────────────────────────────────────────────────
 today = date.today()
@@ -40,10 +54,8 @@ SUPERSET_URL = os.environ.get("SUPERSET_URL", "https://superset.bkosh.com")
 RISK_DB_ID = 45
 KOSH_DB_ID = 1
 
-# ── Paths ──────────────────────────────────────────────────────────────────
+# ── Paths (only used for GitHub Actions Excel output) ──────────────────────
 BASE = Path("output") / f"B2B_{MONTH_LABEL}"
-RISK_DUMP = BASE / f"risk_dump_{SNAPSHOT_DATE}.json"
-INTEREST_MAP = BASE / f"interest_map_{SNAPSHOT_DATE}.json"
 OUT_PATH = BASE / f"b2b_sheet_{SNAPSHOT_DATE}_cleaned.xlsx"
 
 # ── Batch sizes ────────────────────────────────────────────────────────────
@@ -101,7 +113,7 @@ PARTIAL_LENDERS_180 = {
 
 
 # ── Superset auth ──────────────────────────────────────────────────────────
-def _authenticate(session: requests.Session):
+def _authenticate(session):
     login = session.post(
         f"{SUPERSET_URL}/api/v1/security/login",
         json={
@@ -128,7 +140,7 @@ def _authenticate(session: requests.Session):
     })
 
 
-def superset_session() -> requests.Session:
+def superset_session():
     username = os.environ.get("SUPERSET_USERNAME")
     password = os.environ.get("SUPERSET_PASSWORD")
     if not username or not password:
@@ -199,19 +211,9 @@ def modified_dpd(dpd, lender):
     return dpd
 
 
-def style_header(sheet, fill):
-    font = Font(bold=True, color="FFFFFF")
-    center = Alignment(horizontal="center")
-    for cell in sheet[1]:
-        cell.fill = fill
-        cell.font = font
-        cell.alignment = center
-
-
 # ── Data fetchers ──────────────────────────────────────────────────────────
 def fetch_risk_dump(session):
     print(f"Fetching risk dump for {SNAPSHOT_DATE}...")
-    BASE.mkdir(parents=True, exist_ok=True)
     rows = []
     offset = 0
     select_cols = ", ".join(RISK_COLUMNS)
@@ -244,7 +246,6 @@ def fetch_interest_map(session, all_rows):
         and r["writeoff_action"] is None
         and r["loanshare_id"] is not None
     ]
-
     print(f"Fetching interest for {len(active_ids):,} active loanshares...")
     interest = {}
     for start in range(0, len(active_ids), INTEREST_BATCH):
@@ -282,7 +283,6 @@ def identify_removed_rows(all_rows):
         key=lambda r: (r["dpd"] or 0, r["principal_outstanding"] or 0),
         reverse=True,
     )
-
     target = 2e7
     running = 0
     remove_ids = set()
@@ -293,13 +293,120 @@ def identify_removed_rows(all_rows):
         remove_ids.add(row["loanshare_id"])
         removed_rows.append(row)
         running += row["principal_outstanding"]
-
     print(f"Removing {len(remove_ids):,} loanshares | PO = Rs {running/1e7:.4f} cr")
     return remove_ids, removed_rows, running
 
 
-# ── Workbook builder ───────────────────────────────────────────────────────
+# ── Build DataFrame (used by both Dataiku and GitHub Actions) ──────────────
+def build_dataframe(all_rows, interest_map, remove_ids):
+    print("Building dataframe...")
+    records = []
+    for row in all_rows:
+        ls_id = row["loanshare_id"]
+        if ls_id in remove_ids:
+            continue
+        user_status = row["user_status"]
+        writeoff_status = row["writeoff_status"]
+        writeoff_action = row["writeoff_action"]
+        principal_outstanding = row["principal_outstanding"] or 0
+        lender = row["lender"]
+        is_active = (
+            user_status == "loan_disbursed"
+            and writeoff_status is None
+            and writeoff_action is None
+        )
+        accrued_interest = (
+            interest_map.get(int(ls_id), 0)
+            if is_active and ls_id is not None
+            else 0
+        )
+        final_pos = principal_outstanding + accrued_interest
+        disbursal_date = row["disbursal_date"]
+        db_month = str(disbursal_date)[:7] if disbursal_date else None
+
+        records.append({
+            "snapshot_date": SNAPSHOT_DATE,
+            "id": row["id"],
+            "loan_id": row["loan_id"],
+            "loanshare_id": ls_id,
+            "amount": row["amount"],
+            "disbursal_date": disbursal_date,
+            "db_month": db_month,
+            "name": row["name"],
+            "mobile": row["mobile"],
+            "pan_number": row["pan_number"],
+            "state": row["state"],
+            "aadhaar_number": row["aadhaar_number"],
+            "pincode": row["pincode"],
+            "address": row["address"],
+            "partner_loan_id": row["partner_loan_id"],
+            "last_payment_date": row["last_payment_date"],
+            "gender": row["gender"],
+            "dob": row["dob"],
+            "age": row["age"],
+            "employment_type": row["employment_type"],
+            "annual_salary": row["annual_salary"],
+            "topup": row["topup"],
+            "cibil_score": row["cibil_score"],
+            "foir_score": row["foir_score"],
+            "total_collection": row["total_collection"],
+            "dpd": modified_dpd(row["dpd"], lender),
+            "status": row["status"],
+            "tenure": row["tenure"],
+            "lender": lender,
+            "purpose": row["purpose"],
+            "channel": row["channel"],
+            "user_status": user_status,
+            "overdue_amount": row["overdue_amount"],
+            "principal_outstanding": principal_outstanding,
+            "tags_location": row["tags_location"],
+            "relationship_manager": row["relationship_manager"],
+            "greypool": row["greypool"],
+            "emi": row["emi"],
+            "date_created": row["date_created"],
+            "last_updated": row["last_updated"],
+            "writeoff_action": writeoff_action,
+            "writeoff_status": writeoff_status,
+            "fldg": row["fldg"],
+            "last_success_payment_date": row["last_success_payment_date"],
+            "overdue_principal": row["overdue_principal"],
+            "accrued_interest": accrued_interest,
+            "final_pos": final_pos,
+            "created_at": pd.Timestamp.now(),
+        })
+
+    df = pd.DataFrame(records)
+    print(f"  Rows kept  : {len(df):,}")
+    print(f"  Total POS  : Rs {df['final_pos'].sum()/1e7:.2f} cr")
+    return df
+
+
+# ── run_pipeline — entry point for Dataiku ─────────────────────────────────
+def run_pipeline():
+    """Called by Dataiku recipe. Returns DataFrame + metadata."""
+    session = superset_session()
+    all_rows = fetch_risk_dump(session)
+    print(f"Risk rows: {len(all_rows):,}")
+    interest_map = fetch_interest_map(session, all_rows)
+    print(f"Interest map rows: {len(interest_map):,}")
+    remove_ids, removed_rows, po_removed = identify_removed_rows(all_rows)
+    df = build_dataframe(all_rows, interest_map, remove_ids)
+    return df, removed_rows, po_removed
+
+
+# ── GitHub Actions only — Excel + Drive + Email ────────────────────────────
+def style_header(sheet, fill):
+    from openpyxl.styles import Alignment, Font
+    font = Font(bold=True, color="FFFFFF")
+    center = Alignment(horizontal="center")
+    for cell in sheet[1]:
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = center
+
+
 def build_workbook(all_rows, interest_map, remove_ids, removed_rows, running):
+    from openpyxl.styles import PatternFill
     blue_fill = PatternFill("solid", fgColor="1F4E79")
     red_fill = PatternFill("solid", fgColor="C00000")
 
@@ -309,14 +416,12 @@ def build_workbook(all_rows, interest_map, remove_ids, removed_rows, running):
     main.append(HEADERS)
     style_header(main, blue_fill)
 
-    print("Building main sheet...")
     kept = 0
     total_pos = 0
     for row in all_rows:
         ls_id = row["loanshare_id"]
         if ls_id in remove_ids:
             continue
-
         user_status = row["user_status"]
         writeoff_status = row["writeoff_status"]
         writeoff_action = row["writeoff_action"]
@@ -335,7 +440,6 @@ def build_workbook(all_rows, interest_map, remove_ids, removed_rows, running):
         final_pos = principal_outstanding + accrued_interest
         total_pos += final_pos
         kept += 1
-
         disbursal_date = row["disbursal_date"]
         db_month = str(disbursal_date)[:7] if disbursal_date else None
         main.append([
@@ -359,7 +463,6 @@ def build_workbook(all_rows, interest_map, remove_ids, removed_rows, running):
     removed = workbook.create_sheet("removed_loanshares")
     removed.append(REM_HEADERS)
     style_header(removed, red_fill)
-
     for row in removed_rows:
         removed.append([
             row["loanshare_id"], row["loan_id"], row["amount"], row["disbursal_date"],
@@ -370,33 +473,26 @@ def build_workbook(all_rows, interest_map, remove_ids, removed_rows, running):
         ])
 
     print(f"  Removed rows : {len(removed_rows):,}")
+    BASE.mkdir(parents=True, exist_ok=True)
     workbook.save(OUT_PATH)
     print(f"Saved to {OUT_PATH}")
-
     return kept, total_pos
 
 
-# ── Split Excel into parts ─────────────────────────────────────────────────
 def split_excel():
+    from openpyxl.styles import PatternFill
     print("Splitting Excel into parts...")
     blue_fill = PatternFill("solid", fgColor="1F4E79")
-
-    # Calculate number of parts needed based on file size
-    # Target 6MB per part to stay well under Gmail's 25MB total limit
     file_size_mb = OUT_PATH.stat().st_size / 1e6
     part_size_target_mb = 6
     num_parts = max(3, int(file_size_mb / part_size_target_mb) + 1)
     print(f"  File size: {file_size_mb:.1f} MB → splitting into {num_parts} parts")
-
     source = openpyxl.load_workbook(OUT_PATH, read_only=True)
     main_sheet = source.active
     all_data = list(main_sheet.iter_rows(min_row=2, values_only=True))
     source.close()
-
     total_rows = len(all_data)
     chunk_size = (total_rows + num_parts - 1) // num_parts
-    print(f"  Total rows: {total_rows:,} | ~{chunk_size:,} rows per part")
-
     part_paths = []
     for part_num in range(1, num_parts + 1):
         start = (part_num - 1) * chunk_size
@@ -404,39 +500,30 @@ def split_excel():
         chunk = all_data[start:end]
         if not chunk:
             break
-
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = f"part_{part_num}"
         ws.append(HEADERS)
         style_header(ws, blue_fill)
-
         for row in chunk:
             ws.append(list(row))
-
         part_path = BASE / f"b2b_sheet_{SNAPSHOT_DATE}_part{part_num}of{num_parts}.xlsx"
         wb.save(part_path)
         size_mb = part_path.stat().st_size / 1e6
         print(f"  Part {part_num}: {len(chunk):,} rows | {size_mb:.1f} MB")
         part_paths.append(part_path)
-
     return part_paths
 
 
-# ── Google Drive upload ────────────────────────────────────────────────────
 def upload_to_drive():
     print("Uploading to Google Drive...")
-
     service_account_info = json.loads(GDRIVE_SERVICE_ACCOUNT_JSON)
     credentials = service_account.Credentials.from_service_account_info(
         service_account_info,
         scopes=["https://www.googleapis.com/auth/drive"],
     )
     drive_service = build("drive", "v3", credentials=credentials)
-
     file_name = f"B2B Report — {today.strftime('%B %Y')}.xlsx"
-
-    # Delete existing file with same name to avoid duplicates
     existing = drive_service.files().list(
         q=f"name='{file_name}' and '{GDRIVE_FOLDER_ID}' in parents and trashed=false",
         fields="files(id, name)",
@@ -446,53 +533,37 @@ def upload_to_drive():
     for f in existing.get("files", []):
         try:
             drive_service.files().delete(
-                fileId=f["id"],
-                supportsAllDrives=True,
+                fileId=f["id"], supportsAllDrives=True
             ).execute()
-            print(f"  Deleted existing file: {f['name']}")
-        except Exception as del_err:
-            print(f"  Could not delete {f['name']} (already gone?): {del_err}")
-
-    # Upload new file
-    file_metadata = {
-        "name": file_name,
-        "parents": [GDRIVE_FOLDER_ID],
-    }
+            print(f"  Deleted existing: {f['name']}")
+        except Exception as e:
+            print(f"  Could not delete {f['name']}: {e}")
+    file_metadata = {"name": file_name, "parents": [GDRIVE_FOLDER_ID]}
     media = MediaFileUpload(
         str(OUT_PATH),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         resumable=True,
     )
     uploaded = drive_service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id, webViewLink",
-        supportsAllDrives=True,
+        body=file_metadata, media_body=media,
+        fields="id, webViewLink", supportsAllDrives=True,
     ).execute()
-
     file_id = uploaded["id"]
     view_link = uploaded["webViewLink"]
-
-    # Make file accessible to anyone with the link
     drive_service.permissions().create(
         fileId=file_id,
         body={"type": "anyone", "role": "reader"},
         supportsAllDrives=True,
     ).execute()
-
-    print(f"  Uploaded: {file_name}")
-    print(f"  Link: {view_link}")
+    print(f"  Uploaded: {file_name} → {view_link}")
     return view_link
 
 
-# ── Email ──────────────────────────────────────────────────────────────────
-def send_part_emails(kept, total_pos, removed_count, po_removed,
-                     drive_link, part_paths):
+def send_part_emails(kept, total_pos, removed_count, po_removed, drive_link, part_paths):
     print(f"Sending {len(part_paths)} part emails...")
     for i, part_path in enumerate(part_paths, 1):
         size_mb = part_path.stat().st_size / 1e6
         print(f"  Sending part {i}/{len(part_paths)} ({size_mb:.1f} MB)...")
-
         msg = MIMEMultipart()
         msg["From"] = GMAIL_ADDRESS
         msg["To"] = REPORT_RECIPIENT
@@ -500,11 +571,8 @@ def send_part_emails(kept, total_pos, removed_count, po_removed,
             f"✅ B2B Monthly Report — {today.strftime('%B %Y')} "
             f"(Part {i} of {len(part_paths)})"
         )
-
         body = f"Hi Anurag,\n\nPlease find attached Part {i} of {len(part_paths)} of the B2B sheet for {today.strftime('%B %Y')}.\n\n"
         body += f"🔗 Full file on Google Drive: {drive_link}\n\n"
-
-        # Add summary only on first email
         if i == 1:
             body += f"""Summary:
   Snapshot Date     : {SNAPSHOT_DATE}
@@ -516,44 +584,34 @@ def send_part_emails(kept, total_pos, removed_count, po_removed,
 """
         body += f"This is an automated report generated on {today.isoformat()}."
         msg.attach(MIMEText(body, "plain"))
-
         with open(part_path, "rb") as f:
             attachment = MIMEApplication(f.read(), _subtype="xlsx")
             attachment.add_header(
-                "Content-Disposition",
-                "attachment",
-                filename=part_path.name,
+                "Content-Disposition", "attachment", filename=part_path.name
             )
             msg.attach(attachment)
-
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
             server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
             server.sendmail(GMAIL_ADDRESS, REPORT_RECIPIENT, msg.as_string())
-
-        print(f"  Part {i} email sent.")
-        time.sleep(2)  # small pause between emails
-
-    print(f"All {len(part_paths)} part emails sent to {REPORT_RECIPIENT}")
+        print(f"  Part {i} sent.")
+        time.sleep(2)
+    print(f"All {len(part_paths)} emails sent.")
 
 
-def send_drive_only_email(kept, total_pos, removed_count, po_removed,
-                          drive_link, split_error):
+def send_drive_only_email(kept, total_pos, removed_count, po_removed, drive_link, error):
     print("Sending Drive-only fallback email...")
     msg = MIMEMultipart()
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = REPORT_RECIPIENT
     msg["Subject"] = f"✅ B2B Monthly Report — {today.strftime('%B %Y')} (Drive link)"
-
     body = f"""Hi Anurag,
 
 The cleaned B2B sheet for {today.strftime('%B %Y')} is ready.
 
 📎 Download here: {drive_link}
 
-Note: Email attachment failed.
-Reason: {split_error}
-The full file is available on Google Drive at the link above.
+Note: Email attachment failed. Reason: {error}
 
 Summary:
   Snapshot Date     : {SNAPSHOT_DATE}
@@ -565,23 +623,19 @@ Summary:
 This is an automated report generated on {today.isoformat()}.
 """
     msg.attach(MIMEText(body, "plain"))
-
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.starttls()
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_ADDRESS, REPORT_RECIPIENT, msg.as_string())
+    print("Fallback email sent.")
 
-    print(f"Fallback Drive-only email sent to {REPORT_RECIPIENT}")
 
-
-# ── Cleanup ────────────────────────────────────────────────────────────────
 def cleanup():
-    patterns = [RISK_DUMP, INTEREST_MAP, OUT_PATH]
-    for p in BASE.glob("*_part*of*.xlsx"):
-        patterns.append(p)
-    for f in patterns:
+    for f in [OUT_PATH]:
         if f.exists():
             f.unlink()
+    for p in BASE.glob("*_part*of*.xlsx"):
+        p.unlink()
     if BASE.exists():
         try:
             BASE.rmdir()
@@ -591,45 +645,27 @@ def cleanup():
     print("Cleaned up local files")
 
 
-# ── Main ───────────────────────────────────────────────────────────────────
+# ── Main — GitHub Actions entry point ─────────────────────────────────────
 def main():
     BASE.mkdir(parents=True, exist_ok=True)
-
     session = superset_session()
-
     all_rows = fetch_risk_dump(session)
     print(f"Risk rows: {len(all_rows):,}")
-
     interest_map = fetch_interest_map(session, all_rows)
     print(f"Interest map rows: {len(interest_map):,}")
-
     remove_ids, removed_rows, po_removed = identify_removed_rows(all_rows)
-
     kept, total_pos = build_workbook(
         all_rows, interest_map, remove_ids, removed_rows, po_removed
     )
-
-    # Always upload to Drive first
     drive_link = upload_to_drive()
-
-    # Try split + one email per part, fall back to Drive link only
     removed_count = len(removed_rows)
     try:
         part_paths = split_excel()
-        send_part_emails(
-            kept, total_pos, removed_count, po_removed,
-            drive_link, part_paths
-        )
+        send_part_emails(kept, total_pos, removed_count, po_removed, drive_link, part_paths)
     except Exception as e:
         print(f"Split/attach failed: {e}")
-        print("Falling back to Drive-only email...")
-        send_drive_only_email(
-            kept, total_pos, removed_count, po_removed,
-            drive_link, str(e)
-        )
-
+        send_drive_only_email(kept, total_pos, removed_count, po_removed, drive_link, str(e))
     cleanup()
-
     print()
     print("=== SUMMARY ===")
     print(f"Snapshot date       : {SNAPSHOT_DATE}")
